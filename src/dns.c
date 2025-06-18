@@ -106,3 +106,25 @@ void free_domain(domain_t domain) {
 
     free(domain.labels);
 }
+
+dns_header_t *create_dns_refuse_header(uint16_t id) {
+    dns_header_t *header = malloc(sizeof(dns_header_t));
+    if (!header) {
+        fprintf(stderr, "failed to allocate memory\n");
+        exit(-1);
+    }
+
+    header->id = id;
+
+    uint16_t flags = 0;
+    flags |= (1 << 15);
+    flags |= 5;
+    header->flags = htons(flags);
+
+    header->qd_count = 0;
+    header->an_count = 0;
+    header->ns_count = 0;
+    header->ar_count = 0;
+
+    return header;
+}

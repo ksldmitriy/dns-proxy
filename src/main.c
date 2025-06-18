@@ -1,22 +1,17 @@
 #include <stdio.h>
 #include <stddef.h>
-#include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
-#include <sys/epoll.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
-#include <fcntl.h>
-#include <sys/mman.h>
 #include <poll.h>
 #include <time.h>
+#include <toml.h>
+#include <ctype.h>
 
 #include "dns.h"
 
 #define DNS_PORT 53
-#define EXTERNAL_DNS_SERVER "8.8.8.8"
 #define UDP_MESSAGE_LIMIT 512
 #define BUFFER_SIZE UDP_MESSAGE_LIMIT
 #define REQUEST_EXPIRES_AFTER 2000
@@ -40,12 +35,19 @@ typedef struct {
 
 static server_ctx_t ctx;
 
+static char **blacklist;
+static int blacklist_len;
+static char *external_dns_server;
+
+static int load_config();
+
 static int init_context();
 static int init_server();
 static void run_server();
 static void cleanup_server();
 
 static void process_request();
+static char is_domain_allowed(domain_t *domain);
 
 static void queue_add_request(server_ctx_t *ctx, queued_request_t *request);
 static int queue_index_from_id(server_ctx_t *ctx, uint16_t id);
@@ -53,9 +55,17 @@ static void queue_delete_expired(server_ctx_t *ctx);
 static void queue_delete_by_id(server_ctx_t *ctx, uint16_t id);
 
 static uint64_t get_time_ms();
+static void str_to_lower(char *str);
 
 int main() {
-    int ret = init_server();
+    int ret = load_config();
+    if (ret) {
+        fprintf(stderr, "failed to load config file\n");
+        cleanup_server();
+        return -1;
+    }
+
+    ret = init_server();
     if (ret) {
         fprintf(stderr, "failed to initialize server\n");
         cleanup_server();
@@ -66,6 +76,62 @@ int main() {
 
     cleanup_server();
 
+    return 0;
+}
+
+static int load_config() {
+    FILE *fp = fopen("config.toml", "r");
+    if (!fp) {
+        fprintf(stderr, "failed to open config file\n");
+        return -1;
+    }
+
+    char error_buffer[200];
+    toml_table_t *conf = toml_parse_file(fp, error_buffer, sizeof(error_buffer));
+    if (!conf) {
+        fprintf(stderr, "failed to parse config file\n");
+        return -1;
+    }
+
+    toml_datum_t dns_server_toml = toml_string_in(conf, "dns_server");
+    if (!dns_server_toml.ok) {
+        fprintf(stderr, "failed to parse dns_server field\n");
+        toml_free(conf);
+        return -1;
+    }
+
+    external_dns_server = dns_server_toml.u.s;
+
+    toml_array_t *blacklist_toml = toml_array_in(conf, "blacklist");
+    if (!blacklist_toml) {
+        fprintf(stderr, "failed to parse blacklist field\n");
+        toml_free(conf);
+        return -1;
+    }
+
+    int len = toml_array_nelem(blacklist_toml);
+    blacklist = malloc(sizeof(char *) * len);
+    for (int i = 0; i < len; i++) {
+        toml_datum_t domain = toml_string_at(blacklist_toml, i);
+        if (!domain.ok) {
+            fprintf(stderr, "failed to parse blacklist field\n");
+            toml_free(conf);
+            return -1;
+        }
+
+        str_to_lower(domain.u.s);
+        blacklist[i] = domain.u.s;
+        blacklist_len++;
+    }
+
+    printf("config file successfully loaded\n");
+    printf("external dns server: %s\n", external_dns_server);
+    printf("blacklist:\n");
+    for (int i = 0; i < blacklist_len; i++) {
+        printf("    %s\n", blacklist[i]);
+    }
+
+    free(conf);
     return 0;
 }
 
@@ -82,7 +148,7 @@ static int init_context() {
     memset(&ctx.external_dns_addr, 0, sizeof(ctx.external_dns_addr));
     ctx.external_dns_addr.sin_family = AF_INET;
     ctx.external_dns_addr.sin_port = htons(DNS_PORT);
-    inet_pton(AF_INET, EXTERNAL_DNS_SERVER, &ctx.external_dns_addr.sin_addr);
+    inet_pton(AF_INET, external_dns_server, &ctx.external_dns_addr.sin_addr);
 
     ctx.queue = 0;
     ctx.queue_size = 0;
@@ -115,6 +181,8 @@ static int init_server() {
         return -1;
     }
 
+    printf("server successfully initialized\n");
+
     return 0;
 }
 
@@ -124,6 +192,8 @@ static void run_server() {
     struct pollfd poll_fd;
     poll_fd.fd = ctx.sock_fd;
     poll_fd.events = POLLIN;
+
+    printf("server is running\n");
 
     while (ctx.is_running) {
         int ret = poll(&poll_fd, 1, 100);
@@ -145,9 +215,23 @@ static void run_server() {
 
         queue_delete_expired(&ctx);
     }
+
+    printf("server stopped\n");
 }
 
 static void cleanup_server() {
+    if (blacklist) {
+        for (int i; i < blacklist_len; i++) {
+            free(blacklist);
+        }
+
+        free(blacklist);
+    }
+
+    if (external_dns_server) {
+        free(external_dns_server);
+    }
+
     if (ctx.sock_fd != -1) {
         close(ctx.sock_fd);
     }
@@ -183,34 +267,50 @@ static void process_request() {
     if (DNS_GET_QR(header->flags) == 0) { // request
         size_t offset = sizeof(dns_header_t);
 
+        char request_allowed = 1;
         for (int i = 0; i < ntohs(header->qd_count); i++) {
             domain_t domain = parse_domain(ctx.buffer, &offset);
-            char *str = domain_to_str(&domain);
-            if (str) {
-                free(str);
+            if (!is_domain_allowed(&domain)) {
+                request_allowed = 0;
+                free_domain(domain);
+                break;
             }
-
             free_domain(domain);
         }
 
-        int ret = sendto(ctx.sock_fd,
-                         ctx.buffer,
-                         buffer_size,
-                         0,
-                         (const struct sockaddr *)&ctx.external_dns_addr,
-                         sizeof(ctx.external_dns_addr));
-        if (ret < 0) {
-            fprintf(stderr, "sendto to external dns server failed with: %s", strerror(errno));
-            return;
+        if (request_allowed) {
+            int ret = sendto(ctx.sock_fd,
+                             ctx.buffer,
+                             buffer_size,
+                             0,
+                             (const struct sockaddr *)&ctx.external_dns_addr,
+                             sizeof(ctx.external_dns_addr));
+            if (ret < 0) {
+                fprintf(stderr, "sendto to external dns server failed with: %s", strerror(errno));
+                return;
+            }
+
+            queued_request_t request;
+            request.addr = client_addr;
+            request.addr_len = client_addr_len;
+            request.id = header->id;
+            request.expiration_time = get_time_ms() + REQUEST_EXPIRES_AFTER;
+            queue_add_request(&ctx, &request);
+        } else {
+            dns_header_t *refuse_header = create_dns_refuse_header(header->id);
+            int ret = sendto(ctx.sock_fd,
+                             refuse_header,
+                             sizeof(dns_header_t),
+                             0,
+                             (const struct sockaddr *)&client_addr,
+                             client_addr_len);
+            if (ret < 0) {
+                fprintf(stderr, "sendto to external dns server failed with: %s", strerror(errno));
+                free(refuse_header);
+                return;
+            }
+            free(refuse_header);
         }
-
-        queued_request_t request;
-        request.addr = client_addr;
-        request.addr_len = client_addr_len;
-        request.id = header->id;
-        request.expiration_time = get_time_ms() + REQUEST_EXPIRES_AFTER;
-        queue_add_request(&ctx, &request);
-
     } else { // response
         if (memcmp(&ctx.external_dns_addr, &client_addr, client_addr_len) != 0) {
             printf("reponse from unauthorized\n");
@@ -237,6 +337,21 @@ static void process_request() {
 
         queue_delete_by_id(&ctx, header->id);
     }
+}
+
+static char is_domain_allowed(domain_t *domain) {
+    char *str = domain_to_str(domain);
+    str_to_lower(str);
+
+    for (int i = 0; i < blacklist_len; i++) {
+        if (strcmp(blacklist[i], str) == 0) {
+            free(str);
+            return 0;
+        }
+    }
+
+    free(str);
+    return 1;
 }
 
 static void queue_add_request(server_ctx_t *ctx, queued_request_t *request) {
@@ -343,4 +458,11 @@ static uint64_t get_time_ms() {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void str_to_lower(char *str) {
+    int len = strlen(str);
+    for (int i = 0; i < len; i++) {
+        str[i] = tolower(str[i]);
+    }
 }

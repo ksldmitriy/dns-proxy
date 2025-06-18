@@ -26,4 +26,6 @@ domain_t parse_domain(const char *buffer, size_t *offset);
 char *domain_to_str(const domain_t *domain);
 void free_domain(domain_t domain);
 
+dns_header_t *create_dns_refuse_header(uint16_t id);
+
 #endif
