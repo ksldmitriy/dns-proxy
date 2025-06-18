@@ -11,7 +11,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <poll.h>
-#include <ctype.h>
+#include <time.h>
 
 #include "dns.h"
 
@@ -19,10 +19,13 @@
 #define EXTERNAL_DNS_SERVER "8.8.8.8"
 #define UDP_MESSAGE_LIMIT 512
 #define BUFFER_SIZE UDP_MESSAGE_LIMIT
+#define REQUEST_EXPIRES_AFTER 2000
 
 typedef struct {
     struct sockaddr_in addr;
     socklen_t addr_len;
+    uint16_t id;
+    uint64_t expiration_time;
 
 } queued_request_t;
 
@@ -31,6 +34,8 @@ typedef struct {
     char *buffer;
     char is_running;
     struct sockaddr_in external_dns_addr;
+    queued_request_t *queue;
+    int queue_size;
 } server_ctx_t;
 
 static server_ctx_t ctx;
@@ -41,6 +46,13 @@ static void run_server();
 static void cleanup_server();
 
 static void process_request();
+
+static void queue_add_request(server_ctx_t *ctx, queued_request_t *request);
+static int queue_index_from_id(server_ctx_t *ctx, uint16_t id);
+static void queue_delete_expired(server_ctx_t *ctx);
+static void queue_delete_by_id(server_ctx_t *ctx, uint16_t id);
+
+static uint64_t get_time_ms();
 
 int main() {
     int ret = init_server();
@@ -71,6 +83,9 @@ static int init_context() {
     ctx.external_dns_addr.sin_family = AF_INET;
     ctx.external_dns_addr.sin_port = htons(DNS_PORT);
     inet_pton(AF_INET, EXTERNAL_DNS_SERVER, &ctx.external_dns_addr.sin_addr);
+
+    ctx.queue = 0;
+    ctx.queue_size = 0;
 
     return 0;
 }
@@ -111,7 +126,7 @@ static void run_server() {
     poll_fd.events = POLLIN;
 
     while (ctx.is_running) {
-        int ret = poll(&poll_fd, 1, 1000);
+        int ret = poll(&poll_fd, 1, 100);
         if (ret < 0) {
             fprintf(stderr, "poll failed with: %s", strerror(errno));
             ctx.is_running = 0;
@@ -127,6 +142,8 @@ static void run_server() {
             ctx.is_running = 0;
             break;
         }
+
+        queue_delete_expired(&ctx);
     }
 }
 
@@ -138,6 +155,10 @@ static void cleanup_server() {
     if (ctx.buffer) {
         free(ctx.buffer);
         ctx.buffer = 0;
+    }
+
+    if (ctx.queue) {
+        free(ctx.queue);
     }
 }
 
@@ -155,27 +176,171 @@ static void process_request() {
     if (buffer_size < (ssize_t)sizeof(dns_header_t)) {
         return;
     }
-    printf("received %d bytes\n", (int)buffer_size);
 
     const dns_header_t *header = (const dns_header_t *)ctx.buffer;
     offsetof(dns_header_t, flags);
 
     if (DNS_GET_QR(header->flags) == 0) { // request
-        printf("request accepted\n");
-        domain_t *domains = malloc(sizeof(domain_t *) * ntohs(header->qd_count));
-
         size_t offset = sizeof(dns_header_t);
 
         for (int i = 0; i < ntohs(header->qd_count); i++) {
             domain_t domain = parse_domain(ctx.buffer, &offset);
-            domains[i] = domain;
             char *str = domain_to_str(&domain);
             if (str) {
-                printf("requested domain: %s\n", str);
                 free(str);
             }
+
+            free_domain(domain);
         }
+
+        int ret = sendto(ctx.sock_fd,
+                         ctx.buffer,
+                         buffer_size,
+                         0,
+                         (const struct sockaddr *)&ctx.external_dns_addr,
+                         sizeof(ctx.external_dns_addr));
+        if (ret < 0) {
+            fprintf(stderr, "sendto to external dns server failed with: %s", strerror(errno));
+            return;
+        }
+
+        queued_request_t request;
+        request.addr = client_addr;
+        request.addr_len = client_addr_len;
+        request.id = header->id;
+        request.expiration_time = get_time_ms() + REQUEST_EXPIRES_AFTER;
+        queue_add_request(&ctx, &request);
+
     } else { // response
-        printf("answer accepted\n");
+        if (memcmp(&ctx.external_dns_addr, &client_addr, client_addr_len) != 0) {
+            printf("reponse from unauthorized\n");
+            return;
+        }
+
+        int request_i = queue_index_from_id(&ctx, header->id);
+        if (request_i < 0) {
+            return;
+        }
+
+        queued_request_t *request = &ctx.queue[request_i];
+
+        int ret = sendto(ctx.sock_fd,
+                         ctx.buffer,
+                         buffer_size,
+                         0,
+                         (const struct sockaddr *)&request->addr,
+                         request->addr_len);
+        if (ret < 0) {
+            fprintf(stderr, "sendto to client failed with: %s", strerror(errno));
+            return;
+        }
+
+        queue_delete_by_id(&ctx, header->id);
     }
+}
+
+static void queue_add_request(server_ctx_t *ctx, queued_request_t *request) {
+    if (ctx->queue_size == 0) {
+        ctx->queue_size++;
+        ctx->queue = malloc(sizeof(queued_request_t));
+        if (!ctx->queue) {
+            fprintf(stderr, "failed to allocate memory\n");
+            exit(-1);
+        }
+    } else {
+        ctx->queue_size++;
+        ctx->queue = realloc(ctx->queue, sizeof(queued_request_t) * ctx->queue_size);
+        if (!ctx->queue) {
+            fprintf(stderr, "failed to allocate memory\n");
+            exit(-1);
+        }
+    }
+
+    ctx->queue[ctx->queue_size - 1] = *request;
+}
+
+static int queue_index_from_id(server_ctx_t *ctx, uint16_t id) {
+    for (int i = 0; i < ctx->queue_size; i++) {
+        if (ctx->queue[i].id == id) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static void queue_delete_expired(server_ctx_t *ctx) {
+    if (ctx->queue_size == 0) {
+        return;
+    }
+
+    uint64_t cur_time = get_time_ms();
+
+    int write_i = 0;
+    char changed = 0;
+    for (int read_i = 0; read_i < ctx->queue_size; read_i++) {
+        if (ctx->queue[read_i].expiration_time > cur_time) { // keep element
+            ctx->queue[write_i] = ctx->queue[read_i];
+            write_i++;
+        } else {
+            changed = 1;
+        }
+    }
+
+    if (!changed) {
+        return;
+    }
+
+    ctx->queue_size = write_i;
+    if (ctx->queue_size == 0) {
+        free(ctx->queue);
+        ctx->queue = 0;
+        return;
+    }
+
+    ctx->queue = realloc(ctx->queue, sizeof(queued_request_t) * ctx->queue_size);
+    if (!ctx->queue) {
+        fprintf(stderr, "failed to allocate memory\n");
+        exit(-1);
+    }
+}
+
+static void queue_delete_by_id(server_ctx_t *ctx, uint16_t id) {
+    if (ctx->queue_size == 0) {
+        return;
+    }
+
+    int write_i = 0;
+    char changed = 0;
+    for (int read_i = 0; read_i < ctx->queue_size; read_i++) {
+        if (ctx->queue[read_i].id != id) { // keep element
+            ctx->queue[write_i] = ctx->queue[read_i];
+            write_i++;
+        } else {
+            changed = 1;
+        }
+    }
+
+    if (!changed) {
+        return;
+    }
+
+    ctx->queue_size = write_i;
+    if (ctx->queue_size == 0) {
+        free(ctx->queue);
+        ctx->queue = 0;
+        return;
+    }
+
+    ctx->queue = realloc(ctx->queue, sizeof(queued_request_t) * ctx->queue_size);
+    if (!ctx->queue) {
+        fprintf(stderr, "failed to allocate memory\n");
+        exit(-1);
+    }
+}
+
+static uint64_t get_time_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }

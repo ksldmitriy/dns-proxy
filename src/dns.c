@@ -70,7 +70,6 @@ char *domain_to_str(const domain_t *domain) {
     total_len--;
 
     if (total_len <= 0) {
-        printf("empty domain with len %i\n", total_len);
         return 0;
     }
 
