@@ -107,7 +107,7 @@ void free_domain(domain_t domain) {
     free(domain.labels);
 }
 
-dns_header_t *create_dns_refuse_header(uint16_t id) {
+dns_header_t *create_dns_refuse_header(uint16_t id, uint8_t rcode) {
     dns_header_t *header = malloc(sizeof(dns_header_t));
     if (!header) {
         fprintf(stderr, "failed to allocate memory\n");

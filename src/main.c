@@ -38,6 +38,7 @@ static server_ctx_t ctx;
 static char **blacklist;
 static int blacklist_len;
 static char *external_dns_server;
+static uint8_t refuse_r_code;
 
 static int load_config();
 
@@ -123,6 +124,19 @@ static int load_config() {
         blacklist[i] = domain.u.s;
         blacklist_len++;
     }
+
+    toml_datum_t refuse_r_code_toml = toml_int_in(conf, "refuse_r_code");
+    if (!refuse_r_code_toml.ok) {
+        fprintf(stderr, "failed to parse refuse_r_code field\n");
+        toml_free(conf);
+        return -1;
+    } else if (refuse_r_code_toml.u.i <= 0 || refuse_r_code_toml.u.i > 5) {
+        fprintf(stderr, "refuse_r_code should be in range [1, 5]\n");
+        toml_free(conf);
+        return -1;
+    }
+
+    refuse_r_code = refuse_r_code_toml.u.i;
 
     printf("config file successfully loaded\n");
     printf("external dns server: %s\n", external_dns_server);
@@ -297,7 +311,7 @@ static void process_request() {
             request.expiration_time = get_time_ms() + REQUEST_EXPIRES_AFTER;
             queue_add_request(&ctx, &request);
         } else {
-            dns_header_t *refuse_header = create_dns_refuse_header(header->id);
+            dns_header_t *refuse_header = create_dns_refuse_header(header->id, refuse_r_code);
             int ret = sendto(ctx.sock_fd,
                              refuse_header,
                              sizeof(dns_header_t),
