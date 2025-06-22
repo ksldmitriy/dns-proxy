@@ -1,15 +1,21 @@
 SRC_DIR := src
 BUILD_DIR := build
 BIN_DIR := bin
+TOML_DIR := tomlc99
+
 SRCS := $(wildcard $(SRC_DIR)/*.c)
 OBJS := $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
+
 CC := gcc
-CFLAGS := -Wextra -I./tomlc99
-LDFLAGS := -L./tomlc99 -ltoml
+CFLAGS := -Wextra -I./$(TOML_DIR)
+LDFLAGS := -L./$(TOML_DIR) -ltoml
 
 TARGET := $(BIN_DIR)/dns-proxy-server
 
-all: $(TARGET)
+all: $(TOML_DIR)/libtoml.a $(TARGET)
+
+$(TOML_DIR)/libtoml.a:
+	$(MAKE) -C $(TOML_DIR)
 
 $(TARGET): $(OBJS) | $(BIN_DIR)
 	$(CC) $(OBJS) -o $@ $(LDFLAGS)
@@ -22,5 +28,7 @@ $(BUILD_DIR) $(BIN_DIR):
 
 clean:
 	rm -rf $(BUILD_DIR) $(BIN_DIR)
+	$(MAKE) -C $(TOML_DIR) clean
 
 .PHONY: all clean
+
